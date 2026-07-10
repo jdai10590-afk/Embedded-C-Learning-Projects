@@ -1,0 +1,10 @@
+#ifndef FAULT_CODE_H
+#define FAULT_CODE_H
+
+#define FAULT_NONE 0x0000
+#define FAULT_LOW_VOLTAGE 0x0001
+#define FAULT_OVER_CURRENT 0x0002
+#define FAULT_OVER_TEMP 0x0004
+#define FAULT_SENSOR_ERROR 0x0008// sensor fault
+
+#endif
