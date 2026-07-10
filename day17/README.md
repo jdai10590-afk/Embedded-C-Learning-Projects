@@ -1,32 +1,44 @@
-# Day16：UART 串口命令模拟与字符串解析
+# Day17：UART 环形缓冲区与分段命令接收
 
 ## 1. 学习目标
 
-Day16 在 Day15 GPIO 寄存器模拟的基础上，增加 UART 命令处理模块。
+Day17 在 Day16 UART 字符串命令解析的基础上，引入 Ring Buffer 环形缓冲区。
 
-本次学习的主要目标是：
+Day16 中，主程序直接把完整命令交给 UART 模块：
 
-1. 理解 UART 命令控制的基本流程；
-2. 学习使用字符串表示串口命令；
-3. 学习使用 `strcmp()` 比较字符串；
-4. 根据不同命令执行不同操作；
-5. 处理未知命令；
-6. 使用 UART 命令控制模拟 GPIO 和系统状态。
-
-本项目目前支持以下命令：
-
-```text
-STATUS
-LED ON
-LED OFF
-LED TOGGLE
-RESET
+```c
+uart_process_command(&sys, "LED ON");
 ```
 
-同时也能识别未知命令，例如：
+但真实 UART 通常是一个字节一个字节接收，例如：
 
 ```text
-HELLO
+'L'
+'E'
+'D'
+' '
+'O'
+'N'
+'\r'
+'\n'
+```
+
+因此 Day17 实现以下流程：
+
+```text
+UART 字节逐个到达
+        ↓
+写入 Ring Buffer
+        ↓
+主程序逐个取出字符
+        ↓
+拼接 command_buffer
+        ↓
+遇到 '\n'
+        ↓
+得到完整命令
+        ↓
+调用 uart_process_command()
 ```
 
 ---
@@ -34,7 +46,7 @@ HELLO
 ## 2. 工程结构
 
 ```text
-day16
+day17
 ├── Makefile
 ├── include
 │   ├── config.h
@@ -44,6 +56,7 @@ day16
 │   ├── fault_code.h
 │   ├── fault.h
 │   ├── gpio.h
+│   ├── ring_buffer.h
 │   ├── sensor.h
 │   ├── state_machine.h
 │   ├── system.h
@@ -55,408 +68,686 @@ day16
 │   ├── fault.c
 │   ├── gpio.c
 │   ├── main.c
+│   ├── ring_buffer.c
 │   ├── sensor.c
 │   ├── state_machine.c
 │   ├── system.c
 │   └── uart.c
 └── build
-    └── day16_test
+    └── day17_test
 ```
 
-相比 Day15，Day16 新增：
+Day17 新增：
+
+```text
+include/ring_buffer.h
+src/ring_buffer.c
+```
+
+并修改：
 
 ```text
 include/uart.h
 src/uart.c
-```
-
-并修改了：
-
-```text
 src/main.c
 Makefile
 ```
 
 ---
 
-## 3. UART 命令处理流程
+## 3. Ring Buffer 数据结构
 
-Day16 当前采用字符串模拟串口命令。
-
-整体流程为：
-
-```text
-main.c 模拟发送命令
-        ↓
-uart_process_command()
-        ↓
-strcmp() 比较字符串
-        ↓
-找到对应命令分支
-        ↓
-执行 GPIO 或系统操作
-        ↓
-打印 UART 回复
-```
-
-需要注意，目前还不是真实串口硬件接收，而是在电脑上模拟完整命令字符串。
-
-后续学习环形缓冲区后，将进一步模拟字符逐个到达的串口接收过程。
-
----
-
-## 4. uart.h
-
-`uart.h` 用于声明 UART 命令处理函数：
+`ring_buffer.h` 中定义：
 
 ```c
-#ifndef UART_H
-#define UART_H
+#define RING_BUFFER_SIZE 64
 
-#include "system_type.h"
-
-void uart_process_command(SystemStatus *sys, const char *command);
-
-#endif
-```
-
-函数声明：
-
-```c
-void uart_process_command(SystemStatus *sys, const char *command);
-```
-
-包含两个参数：
-
-```text
-SystemStatus *sys
-系统状态变量的地址，函数可以通过它修改系统状态。
-
-const char *command
-指向只读字符串命令，例如 "LED ON"。
-```
-
----
-
-## 5. uart.c
-
-UART 命令处理函数主要使用 `strcmp()` 判断命令内容。
-
-核心结构如下：
-
-```c
-void uart_process_command(SystemStatus *sys, const char *command)
+typedef struct
 {
-    if(strcmp(command, "STATUS") == 0)
-    {
-        /* 打印系统状态 */
-    }
-    else if(strcmp(command, "LED ON") == 0)
-    {
-        /* 打开 LED */
-    }
-    else if(strcmp(command, "LED OFF") == 0)
-    {
-        /* 关闭 LED */
-    }
-    else if(strcmp(command, "LED TOGGLE") == 0)
-    {
-        /* 翻转 LED */
-    }
-    else if(strcmp(command, "RESET") == 0)
-    {
-        /* 系统复位 */
-    }
-    else
-    {
-        /* 未知命令 */
-    }
+    char data[RING_BUFFER_SIZE];
+
+    unsigned int head;
+    unsigned int tail;
+    unsigned int count;
+} RingBuffer;
+```
+
+各成员含义：
+
+```text
+data
+实际保存 UART 字符的数组。
+
+head
+下一次写入数据的位置。
+
+tail
+下一次读取数据的位置。
+
+count
+当前缓冲区内尚未读取的数据数量。
+```
+
+初始化状态：
+
+```text
+head = 0
+tail = 0
+count = 0
+```
+
+---
+
+## 4. 为什么需要 count
+
+仅看：
+
+```text
+head == tail
+```
+
+无法判断缓冲区是空还是满。
+
+缓冲区为空时：
+
+```text
+head = 0
+tail = 0
+count = 0
+```
+
+缓冲区写满并绕回后：
+
+```text
+head = 0
+tail = 0
+count = 64
+```
+
+因此使用：
+
+```text
+count == 0
+```
+
+判断缓冲区为空。
+
+使用：
+
+```text
+count == RING_BUFFER_SIZE
+```
+
+判断缓冲区已满。
+
+---
+
+## 5. 初始化函数
+
+```c
+void ring_buffer_init(RingBuffer *rb)
+{
+    rb->head = 0;
+    rb->tail = 0;
+    rb->count = 0;
+
+    DEBUG_PRINT("ring buffer init done\n");
 }
 ```
 
----
-
-## 6. strcmp() 字符串比较
-
-C 语言不能直接使用下面的方法比较字符串内容：
+调用方法：
 
 ```c
-command == "STATUS"
+RingBuffer uart_rx_buffer;
+
+ring_buffer_init(&uart_rx_buffer);
 ```
 
-这种写法主要比较字符串地址，而不是每个字符的内容。
-
-正确方法是使用：
-
-```c
-strcmp(command, "STATUS")
-```
-
-`strcmp()` 的返回规则为：
-
-```text
-两个字符串相同：返回 0
-两个字符串不同：返回非 0
-```
-
-因此判断命令时需要写：
-
-```c
-if(strcmp(command, "STATUS") == 0)
-```
-
-它表示：
-
-```text
-如果收到的命令和 "STATUS" 完全相同。
-```
-
-使用 `strcmp()` 前需要包含：
-
-```c
-#include <string.h>
-```
+初始化后，缓冲区可以安全进行写入和读取。
 
 ---
 
-## 7. STATUS 命令
+## 6. 判空和判满
 
-收到：
+判断缓冲区为空：
+
+```c
+int ring_buffer_is_empty(const RingBuffer *rb)
+{
+    return rb->count == 0;
+}
+```
+
+返回规则：
 
 ```text
-STATUS
+返回 1：缓冲区为空
+返回 0：缓冲区不为空
+```
+
+判断缓冲区已满：
+
+```c
+int ring_buffer_is_full(const RingBuffer *rb)
+{
+    return rb->count == RING_BUFFER_SIZE;
+}
+```
+
+返回规则：
+
+```text
+返回 1：缓冲区已满
+返回 0：缓冲区未满
+```
+
+---
+
+## 7. 写入数据 push
+
+```c
+int ring_buffer_push(RingBuffer *rb, char byte)
+{
+    if(ring_buffer_is_full(rb))
+    {
+        DEBUG_PRINT("ring buffer full, push failed\n");
+        return 0;
+    }
+
+    rb->data[rb->head] = byte;
+
+    rb->head = (rb->head + 1) % RING_BUFFER_SIZE;
+    rb->count++;
+
+    return 1;
+}
+```
+
+核心步骤：
+
+```text
+1. 判断缓冲区是否已满；
+2. 将 byte 写入 data[head]；
+3. head 移动到下一个位置；
+4. count 增加 1；
+5. 返回写入成功。
+```
+
+调用示例：
+
+```c
+ring_buffer_push(&uart_rx_buffer, 'L');
+```
+
+返回规则：
+
+```text
+返回 1：写入成功
+返回 0：缓冲区已满
+```
+
+---
+
+## 8. 读取数据 pop
+
+```c
+int ring_buffer_pop(RingBuffer *rb, char *byte)
+{
+    if(ring_buffer_is_empty(rb))
+    {
+        DEBUG_PRINT("ring buffer empty, pop failed\n");
+        return 0;
+    }
+
+    *byte = rb->data[rb->tail];
+
+    rb->tail = (rb->tail + 1) % RING_BUFFER_SIZE;
+    rb->count--;
+
+    return 1;
+}
+```
+
+核心步骤：
+
+```text
+1. 判断缓冲区是否为空；
+2. 读取 data[tail]；
+3. 将结果写入调用者的字符变量；
+4. tail 移动到下一个位置；
+5. count 减少 1；
+6. 返回读取成功。
+```
+
+调用示例：
+
+```c
+char received_byte;
+
+ring_buffer_pop(&uart_rx_buffer, &received_byte);
+```
+
+---
+
+## 9. 环形回绕
+
+head 和 tail 的移动方式为：
+
+```c
+(rb->head + 1) % RING_BUFFER_SIZE
+```
+
+以及：
+
+```c
+(rb->tail + 1) % RING_BUFFER_SIZE
+```
+
+假设：
+
+```text
+RING_BUFFER_SIZE = 64
+head = 63
 ```
 
 执行：
 
-```c
-system_print(sys);
+```text
+(63 + 1) % 64
+= 64 % 64
+= 0
 ```
 
-用于打印当前系统状态，包括：
+head 会从数组末尾重新回到下标 0。
+
+移动过程为：
 
 ```text
-LED 状态
-GPIO 输出寄存器
-LED 引脚电平
-系统模式
-电压、电流和温度
-故障码
-事件统计数据
+0 → 1 → 2 → ... → 62 → 63 → 0 → 1
 ```
+
+这就是环形缓冲区名称的来源。
 
 ---
 
-## 8. LED ON 命令
+## 10. FIFO 先进先出
 
-收到：
+环形缓冲区遵循 FIFO：
+
+```text
+First In, First Out
+先进先出
+```
+
+例如依次写入：
+
+```text
+A
+B
+C
+```
+
+读取顺序仍然是：
+
+```text
+A
+B
+C
+```
+
+最早写入的数据最先被读取。
+
+---
+
+## 11. UART 字节接收
+
+Day17 新增：
+
+```c
+int uart_receive_byte(RingBuffer *rx_buffer, char byte)
+{
+    if(ring_buffer_push(rx_buffer, byte) == 0)
+    {
+        printf("[UART] RX buffer full, byte lost: 0x%02X\n",
+               (unsigned char)byte);
+
+        return 0;
+    }
+
+    DEBUG_PRINT("uart received byte: 0x%02X\n",
+                (unsigned char)byte);
+
+    return 1;
+}
+```
+
+该函数用于模拟 UART 每次收到一个字节。
+
+例如：
+
+```c
+uart_receive_byte(&uart_rx_buffer, 'L');
+uart_receive_byte(&uart_rx_buffer, 'E');
+uart_receive_byte(&uart_rx_buffer, 'D');
+```
+
+字符会逐个进入 Ring Buffer。
+
+---
+
+## 12. UART 命令拼接
+
+Day17 使用以下静态变量保存正在接收的命令：
+
+```c
+static char command_buffer[UART_COMMAND_MAX_LENGTH];
+static unsigned int command_length = 0;
+static int command_overflow = 0;
+```
+
+其中：
+
+```text
+command_buffer
+保存正在拼接的命令字符。
+
+command_length
+记录当前已经接收了多少个命令字符。
+
+command_overflow
+记录当前命令是否超过最大长度。
+```
+
+使用 `static` 后，即使函数退出，这些变量的内容仍然保留。
+
+因此一条命令可以分多次到达。
+
+---
+
+## 13. 回车和换行处理
+
+串口终端常使用：
+
+```text
+\r\n
+```
+
+作为一行结束符。
+
+其中：
+
+```text
+\r：回车，十六进制 0x0D
+\n：换行，十六进制 0x0A
+```
+
+程序遇到 `\r` 时忽略：
+
+```c
+if(byte == '\r')
+{
+    continue;
+}
+```
+
+遇到 `\n` 时认为一条命令接收完成：
+
+```c
+if(byte == '\n')
+{
+    command_buffer[command_length] = '\0';
+
+    uart_process_command(sys, command_buffer);
+}
+```
+
+例如接收到：
+
+```text
+'L' 'E' 'D' ' ' 'O' 'N' '\r' '\n'
+```
+
+最终拼成：
 
 ```text
 LED ON
 ```
 
-执行：
+---
+
+## 14. 字符串结束符
+
+C 字符串必须以：
 
 ```c
-sys->led_state = LED_STATE_ON;
-gpio_led_on(sys);
+'\0'
 ```
 
-其中：
+结尾。
+
+因此一条命令接收完成后，需要执行：
 
 ```c
-sys->led_state = LED_STATE_ON;
+command_buffer[command_length] = '\0';
 ```
 
-用于更新软件层面的 LED 状态。
-
-```c
-gpio_led_on(sys);
-```
-
-用于把模拟 GPIO 寄存器中的 LED 位设置为 1。
-
-执行后：
+例如：
 
 ```text
-LED state: 1
-GPIO output reg: 0x00000001
-LED pin level: 1
+'L' 'E' 'D' ' ' 'O' 'N' '\0'
+```
+
+才能作为合法字符串传给：
+
+```c
+strcmp()
+printf("%s")
+uart_process_command()
 ```
 
 ---
 
-## 9. LED OFF 命令
+## 15. 模拟 UART 字节逐个到达
 
-收到：
-
-```text
-LED OFF
-```
-
-执行：
+`main.c` 中新增：
 
 ```c
-sys->led_state = LED_STATE_OFF;
-gpio_led_off(sys);
-```
-
-`gpio_led_off()` 内部通过以下位操作清除 LED 位：
-
-```c
-sys->gpio_output_reg &= ~BIT(LED_GPIO_PIN);
-```
-
-执行后：
-
-```text
-LED state: 0
-GPIO output reg: 0x00000000
-LED pin level: 0
-```
-
----
-
-## 10. LED TOGGLE 命令
-
-收到：
-
-```text
-LED TOGGLE
-```
-
-首先执行：
-
-```c
-gpio_led_toggle(sys);
-```
-
-将 LED 对应的 GPIO 位翻转：
-
-```text
-原来为 0 -> 变成 1
-原来为 1 -> 变成 0
-```
-
-然后通过：
-
-```c
-gpio_led_read(sys)
-```
-
-读取翻转后的 GPIO 电平，并同步更新 `led_state`：
-
-```c
-if(gpio_led_read(sys) == 1)
+static void uart_simulate_input(SystemStatus *sys,
+                                RingBuffer *rx_buffer,
+                                const char *text)
 {
-    sys->led_state = LED_STATE_ON;
-}
-else
-{
-    sys->led_state = LED_STATE_OFF;
+    unsigned int index = 0;
+
+    printf("\n[SIM] Sending: %s", text);
+
+    while(text[index] != '\0')
+    {
+        uart_receive_byte(rx_buffer, text[index]);
+        index++;
+    }
+
+    uart_process_rx_buffer(sys, rx_buffer);
 }
 ```
 
-这样可以保证：
+该函数把完整测试字符串拆成单个字符。
 
-```text
-软件状态 led_state
-模拟硬件状态 gpio_output_reg
-```
-
-始终保持一致。
-
----
-
-## 11. RESET 命令
-
-收到：
-
-```text
-RESET
-```
-
-执行：
+例如：
 
 ```c
-system_init(sys);
-gpio_init(sys);
+uart_simulate_input(
+    &sys,
+    &uart_rx_buffer,
+    "LED ON\r\n"
+);
 ```
 
-复位后：
+实际处理顺序是：
 
 ```text
-系统模式恢复 INIT
-LED 状态恢复 OFF
-GPIO 输出寄存器清零
-故障码清零
-运行统计数据清零
+'L'
+'E'
+'D'
+' '
+'O'
+'N'
+'\r'
+'\n'
 ```
+
+每个字符分别进入 Ring Buffer，然后再被取出并拼接。
 
 ---
 
-## 12. 未知命令处理
+## 16. 分段命令测试
 
-如果收到程序不支持的命令，例如：
-
-```text
-HELLO
-```
-
-前面的所有命令分支都不会成立，最终进入：
+测试代码：
 
 ```c
-else
-{
-    printf("[UART] Unknown command: %s\n", command);
-}
+uart_simulate_input(&sys, &uart_rx_buffer, "LED ");
+uart_simulate_input(&sys, &uart_rx_buffer, "ON\r\n");
 ```
 
-输出：
+第一次只收到：
 
 ```text
-[UART] Unknown command: HELLO
+LED 
 ```
 
-未知命令处理可以避免程序收到错误输入后执行错误操作。
+因为没有换行符，所以程序不会立即执行命令。
+
+此时静态变量保存：
+
+```text
+command_buffer = "LED "
+command_length = 4
+```
+
+第二次收到：
+
+```text
+ON\r\n
+```
+
+最终拼接为：
+
+```text
+LED ON
+```
+
+随后执行：
+
+```text
+[UART] Received command: LED ON
+[UART] LED turned ON
+```
+
+这说明程序支持一条命令分多次接收。
 
 ---
 
-## 13. main.c 命令模拟
+## 17. 命令长度溢出保护
 
-Day16 在 `main.c` 中依次模拟发送：
+定义：
 
 ```c
-uart_process_command(&sys, "STATUS");
-
-uart_process_command(&sys, "LED ON");
-uart_process_command(&sys, "STATUS");
-
-uart_process_command(&sys, "LED OFF");
-uart_process_command(&sys, "STATUS");
-
-uart_process_command(&sys, "LED TOGGLE");
-uart_process_command(&sys, "STATUS");
-
-uart_process_command(&sys, "RESET");
-uart_process_command(&sys, "STATUS");
-
-uart_process_command(&sys, "HELLO");
+#define UART_COMMAND_MAX_LENGTH 32
 ```
 
-每执行一条控制命令后，再通过 `STATUS` 检查系统状态是否正确变化。
+数组总长度是 32，但最后一个位置必须留给：
+
+```c
+'\0'
+```
+
+因此最多只能保存 31 个有效命令字符。
+
+如果命令超过长度，程序执行：
+
+```c
+command_overflow = 1;
+printf("[UART] Command too long\n");
+```
+
+在遇到换行符后，整条命令被丢弃：
+
+```text
+[UART] Command discarded after overflow
+```
+
+然后恢复：
+
+```c
+command_length = 0;
+command_overflow = 0;
+```
+
+后续正常命令仍然可以继续处理。
+
+测试输出：
+
+```text
+[UART] Command too long
+[UART] Command discarded after overflow
+```
+
+随后 `STATUS` 命令仍能正常执行。
 
 ---
 
-## 14. 编译运行
+## 18. Ring Buffer 写满测试
 
-进入 Day16 目录：
+连续写入 64 个字符后：
+
+```text
+head  = 0
+tail  = 0
+count = 64
+full  = 1
+```
+
+继续写入一个字符时：
+
+```text
+[DEBUG] ring buffer full, push failed
+[TEST] Extra push result = 0
+```
+
+说明程序不会覆盖尚未读取的数据。
+
+---
+
+## 19. Ring Buffer 读空测试
+
+读取全部 64 个字符后：
+
+```text
+head  = 0
+tail  = 0
+count = 0
+empty = 1
+```
+
+继续读取时：
+
+```text
+[DEBUG] ring buffer empty, pop failed
+[TEST] Extra pop result = 0
+```
+
+说明程序不会从空缓冲区读取无效数据。
+
+---
+
+## 20. 编译运行
+
+进入 Day17：
 
 ```bash
-cd /root/Embedded_14Days/day16
+cd /root/Embedded_14Days/day17
 ```
 
-清理旧编译文件：
+清理旧文件：
 
 ```bash
 make clean
@@ -474,118 +765,112 @@ make
 make run
 ```
 
+查看 Ring Buffer 边界测试：
+
+```bash
+make run | sed -n '/Ring Buffer Boundary Test/,$p'
+```
+
 ---
 
-## 15. 运行结果
+## 21. 运行结果总结
 
-程序能够正确实现：
+Day17 已成功实现：
 
 ```text
 STATUS
-打印初始系统状态。
-
 LED ON
-LED 状态变为 1，GPIO 第 0 位置 1。
-
 LED OFF
-LED 状态变为 0，GPIO 第 0 位清零。
-
 LED TOGGLE
-LED 从关闭状态翻转为打开状态。
-
 RESET
-系统恢复 INIT，GPIO 和统计数据清零。
+未知命令
+UART 字节逐个接收
+分段命令接收
+命令长度溢出保护
+Ring Buffer 写满保护
+Ring Buffer 读空保护
+head 和 tail 环形回绕
+```
 
-HELLO
-输出 Unknown command。
+关键边界测试结果：
+
+```text
+===== Ring Buffer Boundary Test =====
+[TEST] After filling:
+head  = 0
+tail  = 0
+count = 64
+full  = 1
+[DEBUG] ring buffer full, push failed
+[TEST] Extra push result = 0
+
+[TEST] After draining:
+head  = 0
+tail  = 0
+count = 0
+empty = 1
+[DEBUG] ring buffer empty, pop failed
+[TEST] Extra pop result = 0
 ```
 
 ---
 
-## 16. 调试过程中发现的问题
+## 22. Day17 核心理解
 
-第一次执行 `LED OFF` 后出现：
-
-```text
-LED state: 0
-GPIO output reg: 0x00000001
-LED pin level: 1
-```
-
-这说明软件状态已经变为关闭，但模拟 GPIO 位没有真正清零。
-
-检查 `gpio_led_off()` 后，将核心代码修正为：
-
-```c
-sys->gpio_output_reg &= ~BIT(LED_GPIO_PIN);
-```
-
-修正后结果为：
+Day16 的处理方式：
 
 ```text
-LED state: 0
-GPIO output reg: 0x00000000
-LED pin level: 0
+一次得到完整命令
+        ↓
+直接进行字符串比较
 ```
 
-这个问题说明，软件状态和模拟硬件状态需要同时检查，不能只看一个变量。
+Day17 的处理方式：
+
+```text
+字符逐个到达
+        ↓
+Ring Buffer 暂存
+        ↓
+逐个读取字符
+        ↓
+拼成完整字符串
+        ↓
+解析命令
+```
+
+Day17 的核心可以总结为：
+
+```text
+Ring Buffer 解决数据接收速度和处理速度不完全一致的问题。
+```
+
+当 UART 字节不断到达时，可以先将数据存入缓冲区，再由主程序逐步处理。
 
 ---
 
-## 17. Day16 核心理解
+## 23. 今日收获
 
-Day16 最核心的知识是：
+通过 Day17 学习，掌握了：
 
-```text
-UART 接收到字符串命令后，
-程序需要比较命令内容，
-再执行对应的控制操作。
-```
+1. Ring Buffer 环形缓冲区的基本结构；
+2. `head`、`tail` 和 `count` 的作用；
+3. FIFO 先进先出机制；
+4. 环形下标回绕；
+5. 缓冲区判空和判满；
+6. Ring Buffer 字符写入和读取；
+7. UART 字节逐个接收；
+8. 使用 `\r\n` 判断命令结束；
+9. C 字符串结束符 `\0`；
+10. `static` 局部变量保存跨函数调用状态；
+11. 分段命令拼接；
+12. 命令长度溢出保护；
+13. 缓冲区满和空的边界保护。
 
-核心字符串判断格式为：
-
-```c
-if(strcmp(command, "命令内容") == 0)
-{
-    /* 执行对应操作 */
-}
-```
-
-当前流程仍是完整字符串模拟。
-
-真实 UART 通常是一个字符一个字符到达，例如：
+阶段关系：
 
 ```text
-'L'
-'E'
-'D'
-' '
-'O'
-'N'
-'\n'
-```
-
-因此下一步需要学习环形缓冲区，将逐个到达的数据先缓存起来，再组成完整命令。
-
----
-
-## 18. 今日收获
-
-通过 Day16 的学习，掌握了：
-
-1. UART 命令处理模块的基本结构；
-2. `const char *` 字符串参数；
-3. `strcmp()` 字符串比较方法；
-4. 根据命令执行不同分支；
-5. 使用 UART 命令控制 GPIO；
-6. 同步软件状态和模拟硬件状态；
-7. RESET 系统复位逻辑；
-8. 未知命令处理方法；
-9. 调试 LED 状态与 GPIO 寄存器不一致的问题。
-
-Day16 的核心可以总结为：
-
-```text
-Day15：使用位操作模拟 GPIO 输出
-Day16：使用 UART 字符串命令控制系统
+Day15：GPIO 寄存器与位操作
+Day16：UART 完整字符串命令解析
+Day17：Ring Buffer 与 UART 字节流接收
 ```
