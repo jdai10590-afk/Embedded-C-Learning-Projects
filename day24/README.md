@@ -1,391 +1,421 @@
-# Day23：SPI 基础与单字节全双工通信
+# Day24：SPI 寄存器读写协议与多字节事务
 
 ## 1. 学习目标
 
-Day23 使用 C 语言建立一个简化的 SPI 软件模型，重点理解 SPI 的基本通信过程，而不是直接配置真实单片机寄存器。
-
-本次主要完成：
+Day23 已经完成了 SPI 单字节全双工通信模型，包括：
 
 ```text
-理解 SPI 主机和从机
-认识 SCK、MOSI、MISO、CS
-理解同步通信
-理解单字节全双工交换
-使用占位字节读取从机数据
-模拟 CS 片选和释放
-检查未片选传输
-检查重复片选和重复释放
-检查无效时钟、无效模式和空指针
-统计成功传输次数
+SPI 初始化
+CS 片选控制
+单字节发送与接收
+Dummy Byte
+非法参数检查
+传输次数统计
 ```
 
-最终验证结果：
+Day24 在此基础上继续模拟一个带内部寄存器的 SPI 温度传感器，重点学习：
 
 ```text
-主机发送 0xA5
-从机返回 0x5A
-
-主机发送占位字节 0xFF
-从机返回设备 ID 0x42
-
-未拉低 CS 时传输被拒绝
-失败传输不会增加成功计数
-程序结束时从机处于释放状态
+SPI 寄存器读写协议
+读写命令编码
+多字节 SPI 事务
+寄存器地址
+只读与可写寄存器
+温度高低字节拆分
+温度高低字节组合
+设备 ID 校验
+非法寄存器保护
+SPI 总线忙状态检查
+读写次数与字节交换次数统计
 ```
 
----
-
-## 2. 什么是 SPI
-
-SPI 的英文全称是：
+最终测试结果：
 
 ```text
-Serial Peripheral Interface
-```
-
-中文通常称为：
-
-```text
-串行外设接口
-```
-
-SPI 是一种同步串行通信方式。
-
-“同步”表示主机和从机使用同一根时钟线决定数据传输节奏。
-
-SPI 通常由主机产生时钟，从机根据主机提供的时钟完成数据接收和发送。
-
-典型应用包括：
-
-```text
-Flash 存储器
-显示屏
-SD 卡
-ADC/DAC 芯片
-温度传感器
-加速度计
-陀螺仪
-无线通信模块
+设备 ID读取成功：0x42
+状态寄存器读取成功：0x01
+配置寄存器初始值：0x00
+温度原始值：2534
+温度值：25.34℃
+配置寄存器成功写入：0xA5
+非法寄存器访问被拒绝
+只读寄存器写入被拒绝
+SPI 总线忙时新事务被拒绝
+全部协议测试通过
 ```
 
 ---
 
-## 3. SPI 主机和从机
+## 2. 什么是 SPI 寄存器协议
 
-SPI 通信通常包含：
-
-```text
-主机 Master
-从机 Slave
-```
-
-主机负责：
+真实 SPI 设备通常包含多个内部寄存器，例如：
 
 ```text
-产生 SCK 时钟
-控制 CS 片选
-决定何时开始通信
-决定传输多少个字节
+设备 ID
+工作状态
+配置参数
+传感器测量值
+故障状态
+中断标志
 ```
 
-从机负责：
+主机不能只发送一个固定字节，而是需要通过：
 
 ```text
-等待主机选择
-按照主机时钟接收数据
-同时向主机返回数据
+命令字节
+寄存器地址
+数据字节
 ```
+
+指定访问哪个寄存器，以及执行读取还是写入。
+
+Day24 模拟的设备内部寄存器如下：
+
+| 地址 | 名称 | 功能 | 权限 |
+|---|---|---|---|
+| `0x00` | DEVICE_ID | 设备 ID | 只读 |
+| `0x01` | STATUS | 状态寄存器 | 只读 |
+| `0x02` | TEMP_HIGH | 温度高字节 | 只读 |
+| `0x03` | TEMP_LOW | 温度低字节 | 只读 |
+| `0x04` | CONFIG | 配置寄存器 | 可读写 |
+
+---
+
+## 3. 设备地址和寄存器地址的区别
+
+SPI 通信中需要区分：
+
+```text
+设备选择
+寄存器选择
+```
+
+设备选择由 CS 完成。
 
 例如：
-
-```text
-GD32 单片机：主机
-外部 Flash：从机
-```
-
----
-
-## 4. SPI 的四根常见信号线
-
-SPI 通常使用四根信号线：
-
-```text
-SCK
-MOSI
-MISO
-CS
-```
-
-连接关系：
-
-```text
-SPI 主机                         SPI 从机
-┌──────────┐                  ┌──────────┐
-│          │──── SCK ────────>│          │
-│          │──── MOSI ───────>│          │
-│          │<─── MISO ────────│          │
-│          │──── CS ─────────>│          │
-└──────────┘                  └──────────┘
-```
-
-### SCK
-
-SCK 表示：
-
-```text
-Serial Clock
-串行时钟
-```
-
-通常由主机产生。
-
-在常见的单线数据模式下，交换一个字节需要 8 个时钟周期。
-
-### MOSI
-
-MOSI 表示：
-
-```text
-Master Out Slave In
-```
-
-数据方向：
-
-```text
-主机 → 从机
-```
-
-主机发送命令、寄存器地址和配置数据时通常使用 MOSI。
-
-### MISO
-
-MISO 表示：
-
-```text
-Master In Slave Out
-```
-
-数据方向：
-
-```text
-从机 → 主机
-```
-
-从机返回设备 ID、状态和传感器数据时通常使用 MISO。
-
-### CS
-
-CS 表示：
-
-```text
-Chip Select
-片选
-```
-
-也常写成：
-
-```text
-SS
-NSS
-```
-
-多数 SPI 设备使用低电平有效片选：
-
-```text
-CS = 0：设备被选择
-CS = 1：设备被释放
-```
-
-具体有效电平仍应以芯片数据手册为准。
-
----
-
-## 5. 为什么需要 CS
-
-一个 SPI 主机可以连接多个从机。
-
-多个从机通常共用：
-
-```text
-SCK
-MOSI
-MISO
-```
-
-但每个从机通常拥有独立的 CS。
-
-例如：
-
-```text
-CS_FLASH
-CS_DISPLAY
-CS_SENSOR
-```
-
-主机访问传感器时：
 
 ```text
 CS_SENSOR = 0
-CS_FLASH = 1
-CS_DISPLAY = 1
 ```
 
-这样只有被选中的传感器响应当前通信。
+表示选择温度传感器。
+
+寄存器地址用于选择设备内部的某个数据。
+
+例如：
+
+```text
+0x00：设备 ID
+0x02：温度高字节
+0x04：配置寄存器
+```
+
+因此：
+
+```text
+CS 决定访问哪个设备
+寄存器地址决定访问设备内部哪个数据
+```
 
 ---
 
-## 6. SPI 为什么是全双工
+## 4. 本次 SPI 命令格式
 
-全双工表示：
-
-```text
-发送和接收可以同时进行
-```
-
-SPI 的一个时钟周期内：
+Day24 规定一个命令字节由以下部分组成：
 
 ```text
-主机向从机移出一位数据
-从机也向主机移出一位数据
+bit7：读写标志
+bit6～bit0：寄存器地址
 ```
 
-完成 8 个时钟周期后，双方同时交换一个完整字节。
+定义：
 
-本次测试：
+```c
+#define SPI_DEVICE_READ_FLAG    0x80U
+#define SPI_DEVICE_ADDRESS_MASK 0x7FU
+```
+
+二进制：
 
 ```text
-主机发送：0xA5
-从机返回：0x5A
+0x80 = 1000 0000
+0x7F = 0111 1111
 ```
 
-这不是先完成发送，再单独开始接收，而是在同一组时钟周期内完成交换。
+### 读命令
+
+```text
+bit7 = 1
+```
+
+构造方式：
+
+```c
+command =
+    register_address |
+    SPI_DEVICE_READ_FLAG;
+```
+
+例如读取寄存器 `0x02`：
+
+```text
+0x02 | 0x80 = 0x82
+```
+
+因此：
+
+```text
+0x82
+```
+
+表示读取寄存器 `0x02`。
+
+### 写命令
+
+```text
+bit7 = 0
+```
+
+构造方式：
+
+```c
+command =
+    register_address &
+    SPI_DEVICE_ADDRESS_MASK;
+```
+
+例如写入寄存器 `0x04`：
+
+```text
+0x04 & 0x7F = 0x04
+```
+
+因此：
+
+```text
+0x04
+```
+
+表示写入配置寄存器。
 
 ---
 
-## 7. 主机只想读取时为什么仍要发送数据
+## 5. 为什么使用按位或设置读标志
 
-SPI 时钟通常由主机产生。
-
-如果主机不进行传输，就不会产生时钟，从机也无法将数据移出。
-
-因此主机只想读取数据时，仍需发送一个占位字节，例如：
+寄存器地址：
 
 ```text
-0xFF
+0x02 = 0000 0010
 ```
 
-该字节通常称为：
+读标志：
 
 ```text
+0x80 = 1000 0000
+```
+
+执行按位或：
+
+```text
+0000 0010
+1000 0000
+───────── OR
+1000 0010
+```
+
+得到：
+
+```text
+0x82
+```
+
+表示：
+
+```text
+读取寄存器 0x02
+```
+
+---
+
+## 6. 为什么使用掩码提取寄存器地址
+
+从机收到命令：
+
+```text
+0x82
+```
+
+其中：
+
+```text
+bit7 = 1
+表示读操作
+
+bit6～bit0 = 0x02
+表示寄存器地址
+```
+
+使用：
+
+```c
+address =
+    command &
+    SPI_DEVICE_ADDRESS_MASK;
+```
+
+计算：
+
+```text
+1000 0010
+0111 1111
+───────── AND
+0000 0010
+```
+
+最终恢复寄存器地址：
+
+```text
+0x02
+```
+
+---
+
+## 7. SPI 寄存器读取事务
+
+本次读取一个寄存器需要两个字节交换。
+
+完整流程：
+
+```text
+CS 拉低
+    ↓
+发送读命令
+    ↓
+从机解析命令
+    ↓
+发送 Dummy Byte
+    ↓
+接收寄存器值
+    ↓
+CS 拉高
+```
+
+例如读取设备 ID：
+
+```text
+寄存器地址：0x00
+读命令：0x80
+设备 ID：0x42
+```
+
+事务：
+
+```text
+CS LOW
+TX 0x80
+TX 0xFF / RX 0x42
+CS HIGH
+```
+
+其中：
+
+```text
+第一次交换
+主机发送命令，从机返回占位数据
+
+第二次交换
+主机发送 Dummy Byte，从机返回寄存器值
+```
+
+---
+
+## 8. SPI 寄存器写入事务
+
+写入配置寄存器同样需要两个字节交换。
+
+完整流程：
+
+```text
+CS 拉低
+    ↓
+发送写命令
+    ↓
+发送写入数据
+    ↓
+CS 拉高
+```
+
+例如：
+
+```text
+配置寄存器地址：0x04
+写入数据：0xA5
+```
+
+事务：
+
+```text
+CS LOW
+TX 0x04
+TX 0xA5
+CS HIGH
+```
+
+写入成功后：
+
+```text
+CONFIG = 0xA5
+```
+
+---
+
+## 9. 为什么整个事务期间 CS 必须保持有效
+
+一次寄存器读取通常包含多个字节：
+
+```text
+命令字节
 Dummy Byte
-占位字节
+返回数据
 ```
 
-本项目定义：
-
-```c
-#define SPI_DUMMY_BYTE 0xFFU
-```
-
-读取设备 ID 时：
-
-```c
-spi_transfer_byte(spi,
-                  SPI_DUMMY_BYTE,
-                  &device_id);
-```
-
-本次过程：
+正确时序：
 
 ```text
-主机发送 0xFF
-主要作用：产生 8 个时钟
-
-从机返回 0x42
-实际含义：设备 ID
+CS 拉低
+发送命令
+发送 Dummy Byte
+接收数据
+CS 拉高
 ```
 
-占位字节具体使用 `0x00` 还是 `0xFF`，应根据真实设备协议确定。
+错误时序：
+
+```text
+CS 拉低
+发送命令
+CS 拉高
+
+CS 再拉低
+发送 Dummy Byte
+CS 再拉高
+```
+
+很多真实设备会在 CS 拉高时认为：
+
+```text
+当前事务已经结束
+协议状态被复位
+```
+
+因此 Dummy Byte 可能被当成一条新命令，而不是上一条读取命令的继续。
 
 ---
 
-## 8. SPI 与 UART 的区别
-
-| 对比项 | SPI | UART |
-|---|---|---|
-| 通信类型 | 同步 | 异步 |
-| 时钟线 | 有 SCK | 无独立时钟线 |
-| 常见信号 | SCK、MOSI、MISO、CS | TX、RX |
-| 通信角色 | 主机、从机 | 通常点对点 |
-| 设备选择 | 使用 CS | 通常没有片选 |
-| 数据交换 | 通常全双工 | 通常全双工 |
-| 常见用途 | 芯片间高速通信 | 调试、模块通信 |
-
-SPI 依靠主机时钟同步。
-
-UART 依靠双方预先约定的波特率通信。
-
----
-
-## 9. SPI 模式
-
-SPI 模式由两个参数决定：
+## 10. Day24 工程结构
 
 ```text
-CPOL
-CPHA
-```
-
-### CPOL
-
-CPOL 表示：
-
-```text
-Clock Polarity
-时钟极性
-```
-
-它决定 SCK 空闲时的电平。
-
-```text
-CPOL = 0：时钟空闲为低电平
-CPOL = 1：时钟空闲为高电平
-```
-
-### CPHA
-
-CPHA 表示：
-
-```text
-Clock Phase
-时钟相位
-```
-
-它决定数据在第一个还是第二个有效时钟边沿采样。
-
-四种组合：
-
-| SPI 模式 | CPOL | CPHA |
-|---|---:|---:|
-| Mode 0 | 0 | 0 |
-| Mode 1 | 0 | 1 |
-| Mode 2 | 1 | 0 |
-| Mode 3 | 1 | 1 |
-
-本次使用：
-
-```text
-SPI Mode 0
-```
-
----
-
-## 10. 工程结构
-
-Day23 工程结构：
-
-```text
-day23
+day24
 ├── Makefile
 ├── README.md
 ├── include
@@ -402,6 +432,7 @@ day23
 │   ├── sensor.h
 │   ├── software_timer.h
 │   ├── spi.h
+│   ├── spi_device.h
 │   ├── state_machine.h
 │   ├── system.h
 │   ├── system_type.h
@@ -419,18 +450,19 @@ day23
 │   ├── sensor.c
 │   ├── software_timer.c
 │   ├── spi.c
+│   ├── spi_device.c
 │   ├── state_machine.c
 │   ├── system.c
 │   └── uart.c
 └── build
-    └── day23_test
+    └── day24_test
 ```
 
-Day23 主要新增：
+Day24 新增：
 
 ```text
-include/spi.h
-src/spi.c
+include/spi_device.h
+src/spi_device.c
 ```
 
 主要修改：
@@ -443,803 +475,1082 @@ Makefile
 
 ---
 
-## 11. SPI 模式枚举
+## 11. 模块分层
 
-在 `spi.h` 中定义：
-
-```c
-typedef enum
-{
-    SPI_MODE_0 = 0,
-    SPI_MODE_1,
-    SPI_MODE_2,
-    SPI_MODE_3
-} SpiMode;
-```
-
-对应数值：
+当前 SPI 代码分为三层：
 
 ```text
-SPI_MODE_0 = 0
-SPI_MODE_1 = 1
-SPI_MODE_2 = 2
-SPI_MODE_3 = 3
+main.c
+应用测试层
+        ↓
+spi_device.c
+设备协议层
+        ↓
+spi.c
+SPI 总线层
 ```
 
-相比直接传入数字：
+### main.c
 
-```c
-spi_init(&spi, 1000000U, 0);
+负责：
+
+```text
+初始化设备
+读取设备 ID
+读取状态
+读取温度
+写配置
+验证测试结果
 ```
 
-使用枚举：
+### spi_device.c
 
-```c
-spi_init(&spi,
-         1000000U,
-         SPI_MODE_0);
+负责：
+
+```text
+设备寄存器表
+读写命令协议
+寄存器权限
+温度数据解析
+多字节事务
 ```
 
-含义更加明确。
+### spi.c
+
+负责：
+
+```text
+SPI 初始化
+片选控制
+单字节交换
+总线状态
+传输次数
+```
+
+这种分层方式可以避免：
+
+```text
+应用代码直接处理底层 SPI 细节
+```
 
 ---
 
-## 12. SPI 总线结构体
+## 12. 模拟设备结构体
 
-本次定义：
+定义：
 
 ```c
 typedef struct
 {
-    uint32_t clock_hz;
-    SpiMode mode;
-    uint8_t chip_selected;
-    uint8_t slave_response;
-    uint32_t transfer_count;
-} SpiBus;
+    uint8_t registers[SPI_DEVICE_REGISTER_COUNT];
+    uint32_t read_count;
+    uint32_t write_count;
+} SpiDevice;
 ```
 
-成员作用如下。
-
-### clock_hz
+### registers
 
 ```c
-uint32_t clock_hz;
+uint8_t registers[5];
 ```
 
-保存 SPI 时钟频率，单位为 Hz。
+用于模拟设备内部寄存器。
 
-本次设置：
+对应关系：
 
 ```text
-1000000 Hz
+registers[0]：设备 ID
+registers[1]：状态寄存器
+registers[2]：温度高字节
+registers[3]：温度低字节
+registers[4]：配置寄存器
 ```
 
-也就是：
-
-```text
-1 MHz
-```
-
-### mode
+### read_count
 
 ```c
-SpiMode mode;
+uint32_t read_count;
 ```
 
-保存当前 SPI 工作模式。
+统计成功完成的寄存器读取次数。
 
-本次使用：
-
-```text
-SPI_MODE_0
-```
-
-### chip_selected
+### write_count
 
 ```c
-uint8_t chip_selected;
+uint32_t write_count;
 ```
 
-表示设备是否已经被选择。
-
-```text
-0：设备未选择
-1：设备已选择
-```
-
-需要区分：
-
-```text
-chip_selected = 1
-```
-
-表示逻辑上的“已选中”。
-
-对于低电平有效 CS，它对应：
-
-```text
-CS 引脚电平 = 0
-```
-
-### slave_response
-
-```c
-uint8_t slave_response;
-```
-
-保存模拟从机下一次准备返回的数据。
-
-真实 SPI 中，从机响应通常来自从机内部寄存器或测量结果。
-
-### transfer_count
-
-```c
-uint32_t transfer_count;
-```
-
-记录成功完成的单字节交换次数。
-
-失败传输不会增加该计数。
+统计成功完成的寄存器写入次数。
 
 ---
 
-## 13. SPI 模式合法性检查
+## 13. 设备初始化
 
 函数：
 
 ```c
-int spi_mode_is_valid(SpiMode mode);
+int spi_device_init(SpiDevice *device);
 ```
 
-当前合法值为：
+初始化后寄存器内容：
+
+| 地址 | 初始值 | 含义 |
+|---|---:|---|
+| `0x00` | `0x42` | 设备 ID |
+| `0x01` | `0x01` | 温度数据就绪 |
+| `0x02` | `0x09` | 温度高字节 |
+| `0x03` | `0xE6` | 温度低字节 |
+| `0x04` | `0x00` | 默认配置 |
+
+计数器：
 
 ```text
-0、1、2、3
+read_count = 0
+write_count = 0
 ```
 
-核心代码：
+---
+
+## 14. 设备 ID
+
+定义：
 
 ```c
-if((uint32_t)mode < SPI_MODE_COUNT)
+#define SPI_DEVICE_EXPECTED_ID 0x42U
+```
+
+设备 ID 用于确认：
+
+```text
+SPI 总线连接是否正常
+CS 是否选择了正确设备
+SPI 模式是否正确
+读命令是否正确
+设备型号是否匹配
+```
+
+主机读取后检查：
+
+```c
+if(device_id == SPI_DEVICE_EXPECTED_ID)
+{
+    /* 设备识别成功 */
+}
+```
+
+实际输出：
+
+```text
+[DEVICE] Device ID = 0x42
+[CHECK] Device ID matched
+```
+
+---
+
+## 15. 状态寄存器
+
+定义：
+
+```c
+#define SPI_DEVICE_STATUS_READY 0x01U
+```
+
+表示状态寄存器的 bit0：
+
+```text
+bit0 = 1：温度数据已经准备完成
+bit0 = 0：温度数据还未准备完成
+```
+
+检查方式：
+
+```c
+if((status &
+    SPI_DEVICE_STATUS_READY) != 0U)
+{
+    /* 数据已就绪 */
+}
+```
+
+实际输出：
+
+```text
+[DEVICE] Status = 0x01
+[CHECK] Temperature data is ready
+```
+
+按位与可以只检查目标状态位，而不影响其他状态位。
+
+---
+
+## 16. 寄存器地址合法性检查
+
+函数：
+
+```c
+int spi_device_register_is_valid(
+    uint8_t register_address);
+```
+
+当前寄存器数量：
+
+```c
+#define SPI_DEVICE_REGISTER_COUNT 5U
+```
+
+因此合法地址：
+
+```text
+0x00
+0x01
+0x02
+0x03
+0x04
+```
+
+核心判断：
+
+```c
+if(register_address <
+   SPI_DEVICE_REGISTER_COUNT)
 {
     return 1;
 }
-
-return 0;
 ```
 
-其中：
+非法地址示例：
 
-```c
-#define SPI_MODE_COUNT 4U
+```text
+0x05
+0x20
+0x7F
 ```
-
-强制传入：
-
-```c
-(SpiMode)5
-```
-
-会被判定为非法。
 
 ---
 
-## 14. SPI 初始化
+## 17. 寄存器写权限检查
 
 函数：
 
 ```c
-int spi_init(SpiBus *spi,
-             uint32_t clock_hz,
-             SpiMode mode);
+int spi_device_register_is_writable(
+    uint8_t register_address);
 ```
 
-初始化时检查：
+当前只有：
 
 ```text
-spi 指针是否为空
-clock_hz 是否为 0
-mode 是否在 Mode 0～Mode 3 范围
+0x04 CONFIG
 ```
 
-初始化成功后：
+允许写入。
+
+以下寄存器为只读：
 
 ```text
-clock_hz = 1000000
-mode = SPI_MODE_0
-chip_selected = 0
-slave_response = 0xFF
-transfer_count = 0
+0x00 DEVICE_ID
+0x01 STATUS
+0x02 TEMP_HIGH
+0x03 TEMP_LOW
 ```
 
-调用示例：
+核心判断：
 
 ```c
-SpiBus spi;
-
-spi_init(&spi,
-         1000000U,
-         SPI_MODE_0);
+if(register_address ==
+   SPI_DEVICE_REG_CONFIG)
+{
+    return 1;
+}
 ```
 
 ---
 
-## 15. 为什么时钟不能为 0
+## 18. 为什么设备 ID 不能写入
 
-SPI 是同步通信。
+设备 ID 一般由芯片制造商固定。
 
-如果：
-
-```text
-clock_hz = 0
-```
-
-表示没有 SCK 时钟。
-
-没有时钟时：
+如果允许主机随意修改：
 
 ```text
-主机无法移出数据
-从机无法采样数据
-从机也无法返回数据
+设备身份将失去意义
+驱动无法确认芯片型号
+软件测试会产生错误结果
 ```
 
-所以：
+因此尝试：
 
 ```c
-spi_init(&spi,
-         0U,
-         SPI_MODE_0);
+spi_device_write_register(
+    &spi,
+    &device,
+    SPI_DEVICE_REG_ID,
+    0x99U);
 ```
 
 会返回失败。
 
-真实项目中还需要检查：
+实际输出：
 
 ```text
-主机外设允许的最高频率
-从机芯片允许的最高频率
-系统总线时钟
-SPI 分频值
+[EXPECTED ERROR] Read-only device ID write rejected
+[CHECK] Device ID remains 0x42
 ```
 
 ---
 
-## 16. 选择从机
+## 19. 温度原始值
+
+定义：
+
+```c
+#define SPI_DEVICE_DEFAULT_TEMP_RAW 2534U
+#define SPI_DEVICE_TEMP_SCALE       100.0f
+```
+
+本次规定：
+
+```text
+一个原始单位 = 0.01℃
+```
+
+因此：
+
+```text
+2534 ÷ 100.0 = 25.34℃
+```
+
+换算代码：
+
+```c
+temperature_c =
+    (float)temperature_raw /
+    SPI_DEVICE_TEMP_SCALE;
+```
+
+---
+
+## 20. 为什么温度需要两个寄存器
+
+单个寄存器是 8 位：
+
+```text
+最大无符号值 = 255
+```
+
+温度原始值：
+
+```text
+2534
+```
+
+超过单字节范围，因此需要两个寄存器保存：
+
+```text
+TEMP_HIGH
+TEMP_LOW
+```
+
+2534 转换为十六进制：
+
+```text
+2534 = 0x09E6
+```
+
+所以：
+
+```text
+高字节 = 0x09
+低字节 = 0xE6
+```
+
+---
+
+## 21. 温度高字节拆分
+
+代码：
+
+```c
+device->registers[
+    SPI_DEVICE_REG_TEMP_HIGH] =
+    (uint8_t)(
+        (temperature_raw >> 8) &
+        0xFFU);
+```
+
+以 `0x09E6` 为例：
+
+```text
+0x09E6 >> 8 = 0x0009
+```
+
+得到：
+
+```text
+0x09
+```
+
+---
+
+## 22. 温度低字节拆分
+
+代码：
+
+```c
+device->registers[
+    SPI_DEVICE_REG_TEMP_LOW] =
+    (uint8_t)(
+        temperature_raw &
+        0xFFU);
+```
+
+计算：
+
+```text
+0x09E6 & 0x00FF = 0x00E6
+```
+
+得到：
+
+```text
+0xE6
+```
+
+---
+
+## 23. 温度高低字节组合
+
+读取后得到：
+
+```text
+high_byte = 0x09
+low_byte  = 0xE6
+```
+
+组合：
+
+```c
+temperature_raw =
+    (uint16_t)(
+        ((uint16_t)high_byte << 8) |
+        (uint16_t)low_byte);
+```
+
+计算：
+
+```text
+0x09 << 8 = 0x0900
+0x0900 | 0x00E6 = 0x09E6
+```
+
+十进制：
+
+```text
+0x09E6 = 2534
+```
+
+温度：
+
+```text
+2534 ÷ 100.0 = 25.34℃
+```
+
+---
+
+## 24. 设置模拟温度
 
 函数：
 
 ```c
-int spi_select(SpiBus *spi);
+int spi_device_set_temperature_raw(
+    SpiDevice *device,
+    uint16_t temperature_raw);
 ```
 
-成功后：
+该函数用于模拟传感器产生新的温度数据。
+
+例如：
 
 ```c
-spi->chip_selected = 1U;
+spi_device_set_temperature_raw(
+    &device,
+    3128U);
 ```
 
 表示：
 
 ```text
-设备被选择
-模拟 CS 拉低
+31.28℃
 ```
 
-正确通信顺序：
+3128 转为十六进制：
 
 ```text
-初始化 SPI
-    ↓
-CS 拉低
-    ↓
-交换一个或多个字节
-    ↓
-CS 拉高
-```
-
-重复调用 `spi_select()` 会被拒绝。
-
----
-
-## 17. 释放从机
-
-函数：
-
-```c
-int spi_deselect(SpiBus *spi);
-```
-
-成功后：
-
-```c
-spi->chip_selected = 0U;
-```
-
-表示：
-
-```text
-设备被释放
-模拟 CS 拉高
-```
-
-如果设备本来就没有被选择，再调用释放函数会返回失败。
-
----
-
-## 18. 一次事务可以交换多个字节
-
-SPI 事务不一定只有一个字节。
-
-常见寄存器读取流程可能是：
-
-```c
-spi_select(&spi);
-
-spi_transfer_byte(&spi,
-                  command,
-                  &rx_data);
-
-spi_transfer_byte(&spi,
-                  register_address,
-                  &rx_data);
-
-spi_transfer_byte(&spi,
-                  SPI_DUMMY_BYTE,
-                  &register_value);
-
-spi_deselect(&spi);
+3128 = 0x0C38
 ```
 
 对应：
 
 ```text
-CS 拉低
-    ↓
-发送命令
-    ↓
-发送寄存器地址
-    ↓
-发送占位字节并读取寄存器值
-    ↓
-CS 拉高
+高字节 = 0x0C
+低字节 = 0x38
 ```
-
-很多真实设备要求整个命令过程中 CS 一直保持有效。
 
 ---
 
-## 19. 设置模拟从机响应
+## 25. 读取寄存器函数
 
-函数：
+接口：
 
 ```c
-int spi_set_slave_response(
+int spi_device_read_register(
     SpiBus *spi,
-    uint8_t response);
+    SpiDevice *device,
+    uint8_t register_address,
+    uint8_t *register_value);
 ```
 
-例如：
-
-```c
-spi_set_slave_response(&spi,
-                       0x5AU);
-```
-
-表示从机下一次交换准备返回：
+函数检查：
 
 ```text
-0x5A
+spi 是否为空
+device 是否为空
+register_value 是否为空
+寄存器地址是否合法
+SPI 总线是否空闲
 ```
 
-这个函数只用于软件模拟。
+完整事务：
 
-真实主机不能直接决定从机返回的数据。
+```text
+选择设备
+发送读命令
+准备寄存器响应
+发送 Dummy Byte
+读取寄存器值
+释放设备
+```
+
+只有完整事务成功后：
+
+```c
+device->read_count++;
+```
 
 ---
 
-## 20. 单字节全双工传输
+## 26. 一次寄存器读取为什么有两次字节交换
 
-函数：
+读取设备 ID：
+
+```text
+第一次交换：
+TX 0x80
+RX 0xFF
+
+第二次交换：
+TX 0xFF
+RX 0x42
+```
+
+因此：
+
+```text
+一次寄存器读取
+等于两次 SPI 单字节交换
+```
+
+所以：
+
+```text
+SpiDevice.read_count + 1
+SpiBus.transfer_count + 2
+```
+
+两种计数含义不同：
+
+```text
+read_count
+统计上层寄存器读取次数
+
+transfer_count
+统计底层字节交换次数
+```
+
+---
+
+## 27. 写寄存器函数
+
+接口：
 
 ```c
-int spi_transfer_byte(
+int spi_device_write_register(
     SpiBus *spi,
-    uint8_t tx_data,
-    uint8_t *rx_data);
+    SpiDevice *device,
+    uint8_t register_address,
+    uint8_t register_value);
 ```
 
-参数：
+函数检查：
 
 ```text
-spi
-SPI 总线状态。
-
-tx_data
-主机通过 MOSI 发出的字节。
-
-rx_data
-用于保存主机通过 MISO 接收到的字节。
+指针是否合法
+寄存器地址是否合法
+寄存器是否可写
+SPI 总线是否空闲
 ```
 
-调用：
+完整事务：
 
-```c
-uint8_t rx_data;
-
-spi_transfer_byte(&spi,
-                  0xA5U,
-                  &rx_data);
+```text
+选择设备
+发送写命令
+发送写入数据
+释放设备
+更新设备寄存器
 ```
 
-当前软件模型完成：
+一次成功写入：
 
-```c
-*rx_data = spi->slave_response;
-spi->slave_response = SPI_DUMMY_BYTE;
-spi->transfer_count++;
+```text
+SpiDevice.write_count + 1
+SpiBus.transfer_count + 2
 ```
 
 ---
 
-## 21. 为什么使用输出指针
+## 28. 为什么完整事务成功后才修改寄存器
 
-SPI 传输函数需要返回两个结果：
-
-```text
-传输是否成功
-接收到的数据
-```
-
-一个 C 函数只能直接返回一个值，因此设计为：
-
-```text
-函数返回值：表示成功或失败
-rx_data 指针：保存接收结果
-```
-
-调用方式：
+代码在 SPI 事务全部完成后，才执行：
 
 ```c
-if(spi_transfer_byte(&spi,
-                     0xA5U,
-                     &rx_data))
+device->registers[
+    register_address] =
+    register_value;
+```
+
+这样可以避免：
+
+```text
+SPI 传输失败
+但寄存器却已经被软件修改
+```
+
+正确逻辑：
+
+```text
+通信成功
+    ↓
+设备接受数据
+    ↓
+寄存器更新
+```
+
+---
+
+## 29. 异常事务恢复
+
+辅助函数：
+
+```c
+static void spi_device_abort_transaction(
+    SpiBus *spi);
+```
+
+当事务进行到一半失败时，尝试执行：
+
+```c
+spi_deselect(spi);
+```
+
+目的是恢复：
+
+```text
+CS 高电平
+SPI 总线空闲
+```
+
+否则可能出现：
+
+```text
+chip_selected = 1
+后续事务全部失败
+```
+
+这种处理属于驱动错误恢复机制。
+
+---
+
+## 30. 为什么内部辅助函数使用 static
+
+定义：
+
+```c
+static void spi_device_abort_transaction(
+    SpiBus *spi);
+```
+
+`static` 表示该函数只在：
+
+```text
+spi_device.c
+```
+
+内部可见。
+
+它属于模块内部实现细节，不需要暴露给：
+
+```text
+main.c
+其他驱动模块
+```
+
+---
+
+## 31. SPI 总线忙状态检查
+
+读写函数中检查：
+
+```c
+if(spi->chip_selected != 0U)
 {
-    /* 使用 rx_data */
+    return 0;
 }
 ```
 
----
-
-## 22. 为什么传输前必须检查 CS
-
-初始化后：
+当：
 
 ```text
-chip_selected = 0
+chip_selected = 1
 ```
 
-如果直接执行：
+表示已经有一个事务正在进行。
 
-```c
-spi_transfer_byte(&spi,
-                  0x33U,
-                  &rx_data);
+此时设备驱动不会强行开始新事务，而是直接返回失败。
+
+实际测试：
+
+```text
+[SPI] Bus manually selected
+[EXPECTED ERROR] New transaction rejected while bus busy
+[SPI] Busy bus state released
 ```
 
-函数会返回失败。
+以后进入 RTOS 后，共享 SPI 总线通常还需要使用：
 
-因为从机尚未被选择。
-
-正确顺序：
-
-```c
-spi_select(&spi);
-
-spi_transfer_byte(&spi,
-                  0x33U,
-                  &rx_data);
-
-spi_deselect(&spi);
+```text
+互斥锁
+信号量
 ```
+
+防止多个任务同时访问。
 
 ---
 
-## 23. 正常全双工传输测试
+## 32. 命令编码测试
 
-本次测试：
-
-```text
-主机发送：0xA5
-从机返回：0x5A
-```
-
-代码过程：
-
-```c
-spi_set_slave_response(spi,
-                       0x5AU);
-
-spi_select(spi);
-
-spi_transfer_byte(spi,
-                  0xA5U,
-                  &rx_data);
-
-spi_deselect(spi);
-```
-
-运行结果：
+实际输出：
 
 ```text
-[SPI] CS LOW - Device selected
-[SPI TX] Master sent     : 0xA5
-[SPI RX] Master received : 0x5A
-[SPI] CS HIGH - Device released
-[SPI COUNT] Successful transfers = 1
+[COMMAND] Read ID register        : 0x80
+[COMMAND] Read temperature high   : 0x82
+[COMMAND] Write config register   : 0x04
+[CHECK] Read command bit7 = 1
+[CHECK] Write command bit7 = 0
+```
+
+计算：
+
+```text
+读 ID：
+0x00 | 0x80 = 0x80
+
+读温度高字节：
+0x02 | 0x80 = 0x82
+
+写配置：
+0x04 & 0x7F = 0x04
+```
+
+---
+
+## 33. 设备信息读取测试
+
+程序读取：
+
+```text
+设备 ID
+状态寄存器
+配置寄存器
+```
+
+实际输出：
+
+```text
+[DEVICE] Device ID = 0x42
+[CHECK] Device ID matched
+[DEVICE] Status    = 0x01
+[CHECK] Temperature data is ready
+[DEVICE] Config    = 0x00
+```
+
+三次寄存器读取后：
+
+```text
+Register reads = 3
+SPI byte transfers = 6
+```
+
+因为：
+
+```text
+3 × 2 = 6
+```
+
+---
+
+## 34. 温度读取测试
+
+程序读取：
+
+```text
+0x02：温度高字节
+0x03：温度低字节
+```
+
+实际输出：
+
+```text
+[TEMPERATURE] High byte  = 0x09
+[TEMPERATURE] Low byte   = 0xE6
+[TEMPERATURE] Raw value  = 2534
+[TEMPERATURE] Celsius    = 25.34 C
+[CHECK] Temperature raw value matched
+```
+
+温度读取增加两次寄存器读取：
+
+```text
+read_count：3 → 5
+```
+
+每个寄存器读取包含两次字节交换：
+
+```text
+transfer_count：6 → 10
+```
+
+---
+
+## 35. 配置寄存器写入测试
+
+流程：
+
+```text
+读取写入前配置
+写入新配置
+读取写入后配置
+验证结果
+```
+
+实际输出：
+
+```text
+[WRITE] Config before = 0x00
+[WRITE] New value     = 0xA5
+[WRITE] Config after  = 0xA5
+[CHECK] Configuration write verified
+```
+
+此时：
+
+```text
+Register writes = 1
+SPI byte transfers = 16
+```
+
+---
+
+## 36. 非法地址测试
+
+程序尝试读取：
+
+```text
+0x20
+```
+
+但合法范围只有：
+
+```text
+0x00～0x04
+```
+
+因此输出：
+
+```text
+[EXPECTED ERROR] Invalid register 0x20 rejected
+```
+
+该操作在开始 SPI 事务之前就被拒绝，所以不会增加任何计数。
+
+---
+
+## 37. 只读寄存器保护测试
+
+程序尝试：
+
+```text
+向设备 ID 寄存器写入 0x99
+```
+
+设备 ID 是只读寄存器，所以输出：
+
+```text
+[EXPECTED ERROR] Read-only device ID write rejected
+[CHECK] Device ID remains 0x42
 ```
 
 说明：
 
 ```text
-片选顺序正确
-发送字节正确
-接收字节正确
-成功计数正确
+写入失败
+设备 ID 未改变
+写计数未增加
+SPI 字节交换计数未增加
 ```
 
 ---
 
-## 24. 占位字节读取测试
+## 38. 失败操作不改变计数
 
-模拟设备 ID：
-
-```text
-0x42
-```
-
-从机准备返回：
-
-```c
-spi_set_slave_response(spi,
-                       0x42U);
-```
-
-主机发送：
-
-```c
-SPI_DUMMY_BYTE
-```
-
-其值为：
+非法操作前记录：
 
 ```text
-0xFF
+transfer_count
+read_count
+write_count
 ```
 
-运行结果：
+失败后重新比较。
+
+实际输出：
 
 ```text
-[SPI TX] Dummy byte       : 0xFF
-[SPI RX] Device ID        : 0x42
+[CHECK] All counters unchanged
 ```
 
-说明主机通过发送占位字节产生了时钟，并成功读取从机数据。
+说明只有完整成功的事务才计数。
 
-第二次成功交换后：
+---
+
+## 39. 最终计数分析
+
+最终：
 
 ```text
-transfer_count = 2
+SPI byte transfers = 16
+Register reads     = 7
+Register writes    = 1
+```
+
+七次寄存器读取：
+
+```text
+1. 读取设备 ID
+2. 读取状态
+3. 读取初始配置
+4. 读取温度高字节
+5. 读取温度低字节
+6. 写入前读取配置
+7. 写入后读取配置
+```
+
+每次读取两个字节：
+
+```text
+7 × 2 = 14
+```
+
+一次寄存器写入两个字节：
+
+```text
+1 × 2 = 2
+```
+
+总计：
+
+```text
+14 + 2 = 16
 ```
 
 ---
 
-## 25. 未选择从机时传输测试
-
-测试中没有拉低 CS，直接传输：
-
-```c
-spi_transfer_byte(spi,
-                  0x33U,
-                  &rx_data);
-```
-
-运行结果：
+## 40. 完整运行结果
 
 ```text
-[EXPECTED ERROR] Transfer rejected because CS is HIGH
-[CHECK] Transfer count unchanged: 2
-```
-
-说明：
-
-```text
-未片选传输被拒绝
-失败传输没有增加成功计数
-```
-
----
-
-## 26. 重复片选测试
-
-第一次调用：
-
-```c
-spi_select(spi);
-```
-
-成功。
-
-第二次再次调用：
-
-```c
-spi_select(spi);
-```
-
-由于设备已经被选择，返回失败。
-
-结果：
-
-```text
-[SPI] First select succeeded
-[EXPECTED ERROR] Duplicate select rejected
-```
-
-这可以帮助发现程序中的错误调用顺序。
-
----
-
-## 27. 重复释放测试
-
-第一次调用：
-
-```c
-spi_deselect(spi);
-```
-
-成功。
-
-第二次再次调用：
-
-```c
-spi_deselect(spi);
-```
-
-由于设备已经处于释放状态，返回失败。
-
-结果：
-
-```text
-[SPI] First deselect succeeded
-[EXPECTED ERROR] Duplicate deselect rejected
-```
-
----
-
-## 28. 无效配置测试
-
-本次测试了三个非法情况。
-
-### 时钟为 0
-
-```c
-spi_init(&test_spi,
-         0U,
-         SPI_MODE_0);
-```
-
-结果：
-
-```text
-[EXPECTED ERROR] Zero SPI clock rejected
-```
-
-### 模式非法
-
-```c
-spi_init(&test_spi,
-         1000000U,
-         (SpiMode)5);
-```
-
-结果：
-
-```text
-[EXPECTED ERROR] Invalid SPI mode rejected
-```
-
-### 空指针
-
-```c
-spi_init(NULL,
-         1000000U,
-         SPI_MODE_0);
-```
-
-结果：
-
-```text
-[EXPECTED ERROR] NULL SPI pointer rejected
-```
-
----
-
-## 29. 传输次数统计
-
-`transfer_count` 只记录成功传输。
-
-本次成功传输：
-
-```text
-测试一：0xA5 与 0x5A 交换
-测试二：0xFF 与 0x42 交换
-```
-
-所以最终：
-
-```text
-Successful transfers = 2
-```
-
-以下操作不会增加计数：
-
-```text
-未选择从机时传输
-重复片选
-重复释放
-无效初始化
-```
-
----
-
-## 30. 完整运行结果
-
-```text
-===== Day23 SPI Full-Duplex Test =====
+===== Day24 SPI Register Protocol Test =====
 [SPI CONFIG] Clock = 1000000 Hz
 [SPI CONFIG] Mode = 0
-[SPI CONFIG] Dummy byte = 0xFF
-[SPI CONFIG] Initial CS state = HIGH / released
+[DEVICE CONFIG] Expected ID = 0x42
+[DEVICE CONFIG] Register count = 5
 
------ Test 1: Full-Duplex Transfer -----
-[SPI] CS LOW - Device selected
-[SPI TX] Master sent     : 0xA5
-[SPI RX] Master received : 0x5A
-[SPI] CS HIGH - Device released
-[SPI COUNT] Successful transfers = 1
+----- Test 1: Command Encoding -----
+[COMMAND] Read ID register        : 0x80
+[COMMAND] Read temperature high   : 0x82
+[COMMAND] Write config register   : 0x04
+[CHECK] Read command bit7 = 1
+[CHECK] Write command bit7 = 0
 
------ Test 2: Dummy Byte Read -----
-[SPI] CS LOW - Device selected
-[SPI TX] Dummy byte       : 0xFF
-[SPI RX] Device ID        : 0x42
-[SPI] CS HIGH - Device released
-[SPI COUNT] Successful transfers = 2
+----- Test 2: Device Information -----
+[DEVICE] Device ID = 0x42
+[CHECK] Device ID matched
+[DEVICE] Status    = 0x01
+[CHECK] Temperature data is ready
+[DEVICE] Config    = 0x00
+[COUNT] Register reads = 3
+[COUNT] SPI byte transfers = 6
 
------ Test 3: Transfer Without CS -----
-[EXPECTED ERROR] Transfer rejected because CS is HIGH
-[CHECK] Transfer count unchanged: 2
+----- Test 3: Temperature Read -----
+[TEMPERATURE] High byte  = 0x09
+[TEMPERATURE] Low byte   = 0xE6
+[TEMPERATURE] Raw value  = 2534
+[TEMPERATURE] Celsius    = 25.34 C
+[CHECK] Temperature raw value matched
+[COUNT] Register reads = 5
+[COUNT] SPI byte transfers = 10
 
------ Test 4: Chip Select Sequence -----
-[SPI] First select succeeded
-[EXPECTED ERROR] Duplicate select rejected
-[SPI] First deselect succeeded
-[EXPECTED ERROR] Duplicate deselect rejected
-[SPI COUNT] Successful transfers = 2
+----- Test 4: Configuration Write -----
+[WRITE] Config before = 0x00
+[WRITE] New value     = 0xA5
+[WRITE] Config after  = 0xA5
+[CHECK] Configuration write verified
+[COUNT] Register writes = 1
+[COUNT] SPI byte transfers = 16
 
------ Test 5: Invalid Configuration -----
-[EXPECTED ERROR] Zero SPI clock rejected
-[EXPECTED ERROR] Invalid SPI mode rejected
-[EXPECTED ERROR] NULL SPI pointer rejected
+----- Test 5: Invalid Operations -----
+[EXPECTED ERROR] Invalid register 0x20 rejected
+[EXPECTED ERROR] Read-only device ID write rejected
+[CHECK] Device ID remains 0x42
+[CHECK] All counters unchanged
 
------ Final SPI Status -----
-[SPI STATUS] Successful transfers = 2
-[SPI STATUS] Device selected = NO
+----- Test 6: Busy SPI Bus -----
+[SPI] Bus manually selected
+[EXPECTED ERROR] New transaction rejected while bus busy
+[SPI] Busy bus state released
+[CHECK] Busy rejection changed no counters
 
-===== SPI Test Finished =====
+----- Final Protocol Status -----
+[FINAL] SPI byte transfers = 16
+[FINAL] Register reads     = 7
+[FINAL] Register writes    = 1
+[FINAL] Device selected    = NO
+[FINAL] Config register    = 0xA5
+[FINAL CHECK] All protocol tests passed
+
+===== SPI Register Test Finished =====
 ```
 
-编译过程没有出现：
+编译过程没有：
 
 ```text
 warning
@@ -1248,15 +1559,15 @@ error
 
 ---
 
-## 31. 编译运行
+## 41. 编译运行
 
-进入 Day23：
+进入 Day24：
 
 ```bash
-cd /root/Embedded_14Days/day23
+cd /root/Embedded_14Days/day24
 ```
 
-清理旧文件：
+清理构建文件：
 
 ```bash
 make clean
@@ -1278,18 +1589,18 @@ make run
 
 ```bash
 make run | grep -E \
-"SPI CONFIG|SPI TX|SPI RX|SPI COUNT|SPI STATUS|EXPECTED"
+"COMMAND|DEVICE|TEMPERATURE|WRITE|EXPECTED|FINAL"
 ```
 
 ---
 
-## 32. 自动验证
+## 42. 自动验证
 
-验证正常全双工返回值：
+验证最终检查：
 
 ```bash
 make run | grep -c \
-"Master received : 0x5A"
+"All protocol tests passed"
 ```
 
 预期：
@@ -1298,11 +1609,24 @@ make run | grep -c \
 1
 ```
 
-验证设备 ID：
+验证温度：
 
 ```bash
 make run | grep -c \
-"Device ID        : 0x42"
+"Celsius    = 25.34 C"
+```
+
+预期：
+
+```text
+1
+```
+
+验证配置写入：
+
+```bash
+make run | grep -c \
+"Config after  = 0xA5"
 ```
 
 预期：
@@ -1321,25 +1645,22 @@ make run | grep -c \
 预期：
 
 ```text
-6
+3
 ```
 
-六个预期错误为：
+三个预期错误：
 
 ```text
-未片选传输
-重复选择
-重复释放
-零时钟
-无效模式
-空指针
+非法寄存器地址
+写入只读设备 ID
+总线忙时启动新事务
 ```
 
-验证最终释放状态：
+验证最终片选状态：
 
 ```bash
 make run | grep -c \
-"Device selected = NO"
+"Device selected    = NO"
 ```
 
 预期：
@@ -1350,169 +1671,134 @@ make run | grep -c \
 
 ---
 
-## 33. 本次遇到的错误
+## 43. 本次核心代码
 
-编写 `spi.h` 时，曾误将终端命令写进头文件：
+构造读命令：
 
-```text
-cat > include/spi.h <<'EOF'
+```c
+command =
+    register_address |
+    SPI_DEVICE_READ_FLAG;
 ```
 
-编译器报错：
+构造写命令：
 
-```text
-expected '=', ',', ';', 'asm'
-or '__attribute__' before '>' token
+```c
+command =
+    register_address &
+    SPI_DEVICE_ADDRESS_MASK;
 ```
 
-原因是：
+温度高字节：
 
-```text
-cat > include/spi.h <<'EOF'
+```c
+(temperature_raw >> 8) & 0xFFU
 ```
 
-属于 Bash 终端命令，不是 C 语言代码。
+温度低字节：
 
-正确规则：
-
-```text
-cat > 文件 <<'EOF'
-以及结尾的 EOF
-只在终端中执行。
-
-真正写入 .h 或 .c 文件的内容，
-只能是两个 EOF 标记之间的代码。
+```c
+temperature_raw & 0xFFU
 ```
 
-`make clean` 只能删除构建产物，不能自动修复源文件内容。
+组合高低字节：
 
-修复源文件后重新执行：
-
-```bash
-make clean
-make
-make run
+```c
+((uint16_t)high_byte << 8) |
+(uint16_t)low_byte
 ```
 
-程序成功通过全部测试。
+温度换算：
+
+```c
+(float)temperature_raw / 100.0f
+```
+
+状态位检查：
+
+```c
+(status & SPI_DEVICE_STATUS_READY) != 0U
+```
+
+总线忙检查：
+
+```c
+spi->chip_selected != 0U
+```
 
 ---
 
-## 34. 当前实现的局限
+## 44. 当前实现的局限
 
-本次只是 SPI 软件逻辑模拟，尚未涉及真实硬件中的：
+本次仍然是软件模拟，尚未涉及真实硬件中的：
 
 ```text
-SPI 外设时钟使能
+SPI 外设寄存器
 GPIO 复用配置
-SCK 引脚配置
-MOSI 引脚配置
-MISO 引脚配置
-CS GPIO 输出
-主从模式配置
-数据位宽配置
-时钟分频
-CPOL 和 CPHA 寄存器设置
+真实 SCK 时钟
+真实 MOSI/MISO 电平
 发送缓冲区空标志
 接收缓冲区非空标志
-忙状态检查
+SPI 忙标志
+硬件超时
+芯片上电延时
+真实设备时序
+连续地址读取
+Burst Read
+CRC 校验
 SPI 中断
 SPI DMA
-真实移位寄存器
-多从机片选管理
+RTOS 总线互斥锁
 ```
 
-当前 `slave_response` 只是模拟从机下一次返回的数据。
+当前从机寄存器只是：
 
-后续将建立更接近真实设备的：
-
-```text
-寄存器地址
-读命令
-写命令
-设备 ID
-状态寄存器
-温度高低字节
+```c
+uint8_t registers[5];
 ```
+
+但整体驱动分层和寄存器访问思想与真实 SPI 设备驱动相似。
 
 ---
 
-## 35. 今日核心代码
+## 45. 今日收获
 
-SPI 模式检查：
+通过 Day24 学习，掌握了：
 
-```c
-(uint32_t)mode < SPI_MODE_COUNT
-```
-
-选择从机：
-
-```c
-spi->chip_selected = 1U;
-```
-
-释放从机：
-
-```c
-spi->chip_selected = 0U;
-```
-
-全双工交换：
-
-```c
-*rx_data = spi->slave_response;
-```
-
-恢复默认从机响应：
-
-```c
-spi->slave_response = SPI_DUMMY_BYTE;
-```
-
-成功传输计数：
-
-```c
-spi->transfer_count++;
-```
-
----
-
-## 36. 今日收获
-
-通过 Day23 学习，掌握了：
-
-1. SPI 的基本作用；
-2. SPI 同步通信的含义；
-3. SPI 主机和从机的职责；
-4. SCK 的作用；
-5. MOSI 的数据方向；
-6. MISO 的数据方向；
-7. CS 的片选作用；
-8. 低电平有效片选；
-9. 多个 SPI 从机的选择方式；
-10. SPI 全双工通信的本质；
-11. 单字节传输实际上是单字节交换；
-12. 主机读取数据时仍需产生时钟；
-13. 占位字节的作用；
-14. SPI Mode 0～Mode 3；
-15. CPOL 的基本含义；
-16. CPHA 的基本含义；
-17. 使用枚举表示 SPI 模式；
-18. 使用结构体保存 SPI 总线状态；
-19. 初始化 SPI 时检查参数；
-20. 传输前检查片选状态；
-21. 防止重复选择和重复释放；
-22. 使用输出指针返回接收数据；
-23. 只统计成功传输；
-24. 检查零时钟、非法模式和空指针；
-25. 理解软件模拟与真实硬件驱动的区别；
-26. 定位终端命令误写入 C 文件的问题。
+1. SPI 寄存器协议的基本结构；
+2. 设备选择和寄存器选择的区别；
+3. 使用命令字节区分读写操作；
+4. 使用 bit7 表示读写标志；
+5. 使用 bit6～bit0 表示寄存器地址；
+6. 使用按位或设置读标志；
+7. 使用掩码提取寄存器地址；
+8. SPI 多字节事务；
+9. CS 在完整事务中保持有效；
+10. 两次字节交换完成一次寄存器读取；
+11. 两次字节交换完成一次寄存器写入；
+12. 使用数组模拟设备寄存器；
+13. 设备 ID 的作用；
+14. 状态寄存器的作用；
+15. 使用按位与检查状态位；
+16. 区分只读寄存器和可写寄存器；
+17. 非法寄存器地址检查；
+18. 温度高低字节拆分；
+19. 温度高低字节组合；
+20. 温度原始值换算；
+21. SPI 字节交换计数；
+22. 设备寄存器读写计数；
+23. 失败操作不修改计数；
+24. 总线忙状态检查；
+25. 异常事务后的 CS 恢复；
+26. `static` 内部辅助函数；
+27. 应用层、设备层和总线层分层设计；
+28. 从 SPI 基础通信过渡到 SPI 设备驱动。
 
 当前学习路线：
 
 ```text
 Day15：GPIO 寄存器与位操作
-Day16：UART 完整命令解析
+Day16：UART 命令解析
 Day17：Ring Buffer 与 UART 字节流
 Day18：系统 Tick 与软件定时器
 Day19：按键边沿检测与软件消抖
@@ -1520,36 +1806,56 @@ Day20：按键短按、长按与持续按住
 Day21：CAN 数据帧、ID 过滤与解析
 Day22：ADC 采样、电压换算与数字滤波
 Day23：SPI 基础与单字节全双工通信
+Day24：SPI 寄存器读写协议与多字节事务
 ```
 
 ---
 
-## 37. 下一步学习计划
+## 46. 下一步学习计划
 
-Day24 继续学习：
+Day25 将开始学习：
 
 ```text
-SPI 模式与寄存器读写协议
+I²C 基础通信
 ```
 
-计划模拟一个 SPI 温度传感器：
+计划内容：
 
 ```text
-寄存器 0x00：设备 ID
-寄存器 0x01：状态
-寄存器 0x02：温度高字节
-寄存器 0x03：温度低字节
+SCL 与 SDA
+开漏输出
+上拉电阻
+START 起始信号
+STOP 停止信号
+7 位设备地址
+读写方向位
+ACK 应答
+NACK 非应答
+单字节写入
+单字节读取
+非法地址检查
+总线忙状态
 ```
 
-主要学习：
+Day25 将重点理解：
 
 ```text
-SPI 多字节事务
-命令字节
-寄存器地址
-读写位
-CS 在完整事务中保持有效
-高低字节组合
-设备 ID 验证
-非法寄存器检查
+SPI 使用 CS 选择设备
+I²C 使用设备地址选择设备
+```
+
+---
+
+## 47. 项目仓库
+
+项目地址：
+
+```text
+https://github.com/jdai10590-afk/Embedded-C-Learning-Projects
+```
+
+Day24 目录：
+
+```text
+https://github.com/jdai10590-afk/Embedded-C-Learning-Projects/tree/main/day24
 ```
